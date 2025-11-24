@@ -7,7 +7,9 @@
 #include "BluetoothA2DPSink.h"
 
 // ---------------- PIN ----------------
-#define BTN_PIN 15
+#define BTN_PIN 13
+#define BTN_NEXT 27
+#define BTN_PREV 14
 
 #define RFID_SCK  19  
 #define RFID_MISO 15  
@@ -36,6 +38,13 @@ volatile unsigned long btnPressTime = 0;
 unsigned long pressStart = 0;
 bool btnPrev = HIGH;
 volatile int mode = 0; // 0 = RFID, 1 = Bluetooth
+unsigned long nextPressStart = 0;
+unsigned long prevPressStart = 0;
+bool nextPrev = HIGH;
+bool prevPrev = HIGH;
+
+int volumeLevel = 50;   // เริ่มต้น 50%
+float sdVolume = 1.0f;   // 1.0 = 100%
 
 
 File file;
@@ -184,7 +193,17 @@ void TaskAudio(void *pv){
     if(isPlaying && file){
       if(file.available()){
         size_t bytes_read = file.read(buffer, sizeof(buffer));
+
+        // --- Digital Volume Scaling ---
+        int16_t *samples = (int16_t*)buffer;  // wav 16-bit
+        int count = bytes_read / 2;
+
+        for(int i=0; i<count; i++){
+            samples[i] = samples[i] * sdVolume;
+        }
+
         i2s_write(I2S_NUM_0, buffer, bytes_read, &bytes_written, portMAX_DELAY);
+
       } else {
         file.seek(44);
       }
@@ -215,11 +234,61 @@ void stopAudio() {
   }
 }
 
+void volumeUp(){
+  volumeLevel += 5;
+  if(volumeLevel > 100) volumeLevel = 100;
+
+  a2dp_sink.set_volume(volumeLevel);
+  Serial.print("🔊 Volume Up: ");
+  Serial.println(volumeLevel);
+}
+
+void volumeDown(){
+  volumeLevel -= 5;
+  if(volumeLevel < 0) volumeLevel = 0;
+
+  a2dp_sink.set_volume(volumeLevel);
+  Serial.print("🔉 Volume Down: ");
+  Serial.println(volumeLevel);
+}
+
+void sdVolumeUp(){
+  sdVolume += 0.1f;
+  if(sdVolume > 1.0f) sdVolume = 1.0f;
+  Serial.print("🔊 SD Volume Up: ");
+  Serial.println(sdVolume);
+}
+
+void sdVolumeDown(){
+  sdVolume -= 0.1f;
+  if(sdVolume < 0.0f) sdVolume = 0.0f;
+  Serial.print("🔉 SD Volume Down: ");
+  Serial.println(sdVolume);
+}
+
+void btNext(){
+  if(mode == 1){
+    Serial.println("⏭️ BT Next Song");
+    a2dp_sink.next();
+  }
+}
+
+void btPrev(){
+  if(mode == 1){
+    Serial.println("⏮️ BT Previous Song");
+    a2dp_sink.previous();
+  }
+}
+
+
 // ---------------- SETUP ----------------
 void setup(){
   Serial.begin(115200);
 
   pinMode(BTN_PIN, INPUT_PULLUP);
+  pinMode(BTN_NEXT, INPUT_PULLUP);
+  pinMode(BTN_PREV, INPUT_PULLUP);
+
   attachInterrupt(BTN_PIN, switchModeISR, FALLING);
 
   // SD
@@ -241,13 +310,12 @@ void setup(){
 }
 
 void loop() {
+  // ---------------- MODE BUTTON ----------------
   bool btnNow = digitalRead(BTN_PIN);
-
   // ตรวจว่ากดลง
   if (btnPrev == HIGH && btnNow == LOW) {
     pressStart = millis();
   }
-
   // ตรวจว่าปล่อยปุ่ม
   if (btnPrev == LOW && btnNow == HIGH) {
     unsigned long pressTime = millis() - pressStart;
@@ -275,6 +343,55 @@ void loop() {
       Serial.println(mode == 0 ? "💿RFID" : "🔊Bluetooth");
     }
   }
-
   btnPrev = btnNow;
+
+  // ---------------- NEXT BUTTON ----------------
+  bool nextNow = digitalRead(BTN_NEXT);
+
+  if(nextPrev == HIGH && nextNow == LOW){
+    nextPressStart = millis();
+  }
+
+  if(nextPrev == LOW && nextNow == HIGH){
+    unsigned long pressTime = millis() - nextPressStart;
+
+    if(pressTime < 500){
+      // short press = volume up
+      if(mode == 1){
+          volumeUp();     // Bluetooth mode
+      } else {
+          sdVolumeUp();   // SD / RFID mode
+      }
+    }else{
+      // long press = next song (BT only)
+      btNext();
+    }
+  }
+  nextPrev = nextNow;
+
+  // ---------------- PREV BUTTON ----------------
+  bool prevNow = digitalRead(BTN_PREV);
+
+  if(prevPrev == HIGH && prevNow == LOW){
+    prevPressStart = millis();
+  }
+
+  if(prevPrev == LOW && prevNow == HIGH){
+    unsigned long pressTime = millis() - prevPressStart;
+
+    if(pressTime < 500){
+      // short press = volume down
+      if(mode == 1){
+          volumeDown();       // Bluetooth mode
+      } else {
+          sdVolumeDown();     // SD / RFID mode
+      }
+    }else{
+      // long press = prev song (BT only)
+      btPrev();
+    }
+  }
+
+  prevPrev = prevNow;  
+
 }
