@@ -176,6 +176,9 @@ void enterModeRFID() {
   
   mode = 0;
   isPlaying = false;
+  isManuallyPaused = false;   // <<< สำคัญ: ล้างสถานะหยุดด้วยมือ
+  // ล้าง UID ล่าสุด เพื่อให้บัตรเดิมที่แตะอีกครั้งถูกมองว่าเป็น "บัตรใหม่" 
+  memset(lastUID, 0, 4);      // <<< สำคัญ: ล้าง UID ล่าสุด
   Serial.println("✅ RFID Mode Ready");
 }
 
