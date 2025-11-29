@@ -5,6 +5,8 @@
 #include <driver/i2s.h>
 #include "AudioTools.h"
 #include "BluetoothA2DPSink.h"
+#include "soc/soc.h"             
+#include "soc/rtc_cntl_reg.h"   
 
 // ---------------- PIN ----------------
 #define BTN_PIN 13
@@ -34,24 +36,25 @@ MFRC522 rfid(RFID_SS, RFID_RST, &SPI_RFID);
 // ---------------- GLOBAL ----------------
 unsigned long lastPress = 0;
 volatile bool btnPressed = false;
-volatile unsigned long btnPressTime = 0;
 unsigned long pressStart = 0;
 bool btnPrev = HIGH;
-volatile int mode = 0; // 0 = RFID, 1 = Bluetooth
+
+// Mode: 0 = RFID, 1 = Bluetooth
+volatile int mode = 0; 
+
 unsigned long nextPressStart = 0;
 unsigned long prevPressStart = 0;
 bool nextPrev = HIGH;
 bool prevPrev = HIGH;
 
-int volumeLevel = 50;   // เริ่มต้น 50%
-float sdVolume = 1.0f;   // 1.0 = 100%
-
+int volumeLevel = 50;   // BT Volume
+float sdVolume = 1.0f;  // SD Volume
 
 File file;
 bool isPlaying = false;
 byte lastUID[4] = {0,0,0,0};
 
-uint8_t buffer[2048];
+uint8_t buffer[512];
 size_t bytes_written;
 
 unsigned long lastSeen = 0;
@@ -66,14 +69,47 @@ byte style[4]      = {0x55, 0x9C, 0xD1, 0x49};
 byte shakeitoff[4] = {0xAE, 0x4F, 0x37, 0x06};
 byte blankspace[4] = {0x9C, 0x4C, 0x3A, 0x06};
 
+// ---------------- PROTOTYPES ----------------
+void fadeOut();
+void injectSilence();
+void i2s_init_sd();
+
 // ---------------- FUNC ----------------
 bool isSameUID(byte *a, byte *b){
   for(int i=0;i<4;i++) if(a[i]!=b[i]) return false;
   return true;
 }
 
+// ฟังก์ชันค่อยๆ หรี่เสียง (Software Fade Out)
+void fadeOut() {
+  if (!isPlaying) return; 
+  float originalVol = sdVolume;
+  for (float v = originalVol; v >= 0; v -= 0.1f) {
+    sdVolume = v;
+    vTaskDelay(20); 
+  }
+  sdVolume = 0.0f;
+  vTaskDelay(50); 
+  sdVolume = originalVol; 
+}
+
+// ฟังก์ชันยัดเสียงเงียบและล้าง DMA
+void injectSilence() {
+  uint8_t silenceBuffer[512]; 
+  memset(silenceBuffer, 0, sizeof(silenceBuffer)); 
+  size_t bytes_out;
+  for (int i = 0; i < 5; i++) {
+    i2s_write(I2S_NUM_0, silenceBuffer, sizeof(silenceBuffer), &bytes_out, 100);
+    delay(5);
+  }
+  i2s_zero_dma_buffer(I2S_NUM_0);
+}
+
+// ตั้งค่า I2S สำหรับ SD Card (Manual Driver)
 void i2s_init_sd(){
+  // ต้อง Uninstall ก่อนเสมอเผื่อมี config เก่าค้าง
   i2s_driver_uninstall(I2S_NUM_0);
+  delay(100); 
 
   i2s_config_t config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
@@ -82,7 +118,7 @@ void i2s_init_sd(){
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
     .communication_format = I2S_COMM_FORMAT_I2S_MSB,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-    .dma_buf_count = 4,
+    .dma_buf_count = 8,  // เพิ่ม Buffer หน่อยเพื่อความลื่น
     .dma_buf_len = 256
   };
 
@@ -95,23 +131,60 @@ void i2s_init_sd(){
 
   i2s_driver_install(I2S_NUM_0, &config, 0, NULL);
   i2s_set_pin(I2S_NUM_0, &pin_config);
+  i2s_zero_dma_buffer(I2S_NUM_0);
 }
 
-void startBluetooth(){
-  a2dp_sink.end(true); 
+// เข้าโหมด Bluetooth
+void enterModeBluetooth() {
+  Serial.println("🔄 Switching to Bluetooth...");
+  
+  // 1. หยุด SD
+  if(isPlaying) fadeOut();
+  isPlaying = false;
+  if(file) file.close();
+  injectSilence();
+  
+  // 2. ถอด Driver SD ออก (สำคัญมาก! ไม่งั้น BT จะแย่งใช้ไม่ได้)
+  i2s_driver_uninstall(I2S_NUM_0); 
+  delay(200);
+
+  // 3. เริ่ม Bluetooth
   auto cfg = i2s_bt.defaultConfig();
   cfg.pin_bck = I2S_BCLK;
   cfg.pin_ws  = I2S_LRC;
   cfg.pin_data = I2S_DIN;
   i2s_bt.begin(cfg);
+  
+  a2dp_sink.set_volume(volumeLevel);
   a2dp_sink.start("MIFI");
+  
+  mode = 1;
+  Serial.println("✅ Bluetooth Mode Ready");
 }
 
-void stopBluetooth(){
-  a2dp_sink.end(true);
+// เข้าโหมด RFID / SD
+void enterModeRFID() {
+  Serial.println("🔄 Switching to RFID/SD...");
+  
+  // 1. หยุด Bluetooth และคืนทรัพยากร
+  a2dp_sink.stop();
+  a2dp_sink.end(true); // true = release i2s
+  delay(200);
+
+  // 2. เริ่ม Driver SD ใหม่
+  i2s_init_sd();
+  
+  mode = 0;
+  isPlaying = false;
+  Serial.println("✅ RFID Mode Ready");
 }
 
 void openFileForUID(byte *uid){
+  if(isPlaying) {
+      fadeOut();
+      isPlaying = false;
+      injectSilence();
+  }
 
   if(file) file.close();
 
@@ -138,19 +211,11 @@ void openFileForUID(byte *uid){
   Serial.println("🎵 New song selected");
 }
 
-// ---------------- BUTTON ISR ----------------
-void IRAM_ATTR switchModeISR() {
-  if (!btnPressed) {        // กดครั้งแรก
-    btnPressed = true;
-    btnPressTime = millis();
-  }
-}
-
 // ---------------- TASK RFID ----------------
 void TaskRFID(void *pv){
   while(1){
     if(mode == 1){ 
-      vTaskDelay(100);
+      vTaskDelay(200); // ถ้าอยู่โหมด BT ให้หลับยาวหน่อย
       continue;
     }
 
@@ -158,7 +223,10 @@ void TaskRFID(void *pv){
       lastSeen = millis();
 
       if(isSameUID(rfid.uid.uidByte, lastUID)){
-        isPlaying = true;
+        if (!isPlaying) {
+             // ถ้าวางบัตรเดิม แต่เพลงหยุดไปแล้ว ให้เล่นใหม่
+             isPlaying = true;
+        }
         vTaskDelay(50);
         continue;
       }
@@ -166,7 +234,10 @@ void TaskRFID(void *pv){
     }
 
     if(isPlaying && (millis()-lastSeen > CARD_TIMEOUT)){
+      Serial.println("⏳ Timeout - Fadeout");
+      fadeOut();
       isPlaying = false;
+      injectSilence(); 
     }
 
     vTaskDelay(50);
@@ -176,17 +247,15 @@ void TaskRFID(void *pv){
 // ---------------- TASK AUDIO ----------------
 void TaskAudio(void *pv){
   while(1){
-
-    // Bluetooth Mode
+    // Bluetooth Mode -> ปล่อยให้ Library จัดการ เราไม่ต้องยุ่ง
     if(mode == 1){
-      isPlaying = false;
-      vTaskDelay(50);
+      vTaskDelay(100);
       continue;
     }
 
     // SD Player Mode
     if(!isPlaying){
-      vTaskDelay(5);
+      vTaskDelay(10);
       continue;
     }
 
@@ -195,111 +264,104 @@ void TaskAudio(void *pv){
         size_t bytes_read = file.read(buffer, sizeof(buffer));
 
         // --- Digital Volume Scaling ---
-        int16_t *samples = (int16_t*)buffer;  // wav 16-bit
+        int16_t *samples = (int16_t*)buffer;  
         int count = bytes_read / 2;
-
         for(int i=0; i<count; i++){
             samples[i] = samples[i] * sdVolume;
         }
 
-        i2s_write(I2S_NUM_0, buffer, bytes_read, &bytes_written, portMAX_DELAY);
+        size_t bytes_out;
+        i2s_write(I2S_NUM_0, buffer, bytes_read, &bytes_out, portMAX_DELAY);
 
       } else {
-        file.seek(44);
+        // เพลงจบแล้ว วนลูป หรือ หยุด
+        file.seek(44); // Loop
       }
     }
-
     vTaskDelay(1);
   }
 }
 
 // =========================
-// Play / Stop Audio Control
+// Play / Stop / Volume
 // =========================
 void playAudio() {
   if (mode == 1) {
-    Serial.println("BT Play Request");
+    Serial.println("▶️ BT Play Request");
+    a2dp_sink.play(); // สั่ง BT เล่น
   } else {
-    if (file) file.seek(44);
-    isPlaying = true;
+    if (file) {
+        Serial.println("▶️ SD Play Request");
+        file.seek(44);
+        isPlaying = true;
+    }
   }
 }
 
 void stopAudio() {
   if (mode == 1) {
-    Serial.println("BT Stop Request");
-    a2dp_sink.stop();
+    Serial.println("⏸️ BT Pause Request");
+    a2dp_sink.pause(); // สั่ง BT หยุดชั่วคราว
   } else {
+    Serial.println("⏸️ SD Stop Request");
+    fadeOut();
     isPlaying = false;
+    injectSilence();
   }
 }
 
 void volumeUp(){
   volumeLevel += 5;
   if(volumeLevel > 100) volumeLevel = 100;
-
   a2dp_sink.set_volume(volumeLevel);
-  Serial.print("🔊 Volume Up: ");
-  Serial.println(volumeLevel);
+  Serial.printf("🔊 Vol: %d\n", volumeLevel);
 }
 
 void volumeDown(){
   volumeLevel -= 5;
   if(volumeLevel < 0) volumeLevel = 0;
-
   a2dp_sink.set_volume(volumeLevel);
-  Serial.print("🔉 Volume Down: ");
-  Serial.println(volumeLevel);
+  Serial.printf("🔉 Vol: %d\n", volumeLevel);
 }
 
 void sdVolumeUp(){
   sdVolume += 0.1f;
   if(sdVolume > 1.0f) sdVolume = 1.0f;
-  Serial.print("🔊 SD Volume Up: ");
-  Serial.println(sdVolume);
+  Serial.printf("🔊 SD Vol: %.1f\n", sdVolume);
 }
 
 void sdVolumeDown(){
   sdVolume -= 0.1f;
   if(sdVolume < 0.0f) sdVolume = 0.0f;
-  Serial.print("🔉 SD Volume Down: ");
-  Serial.println(sdVolume);
+  Serial.printf("🔉 SD Vol: %.1f\n", sdVolume);
 }
-
-void btNext(){
-  if(mode == 1){
-    Serial.println("⏭️ BT Next Song");
-    a2dp_sink.next();
-  }
-}
-
-void btPrev(){
-  if(mode == 1){
-    Serial.println("⏮️ BT Previous Song");
-    a2dp_sink.previous();
-  }
-}
-
 
 // ---------------- SETUP ----------------
 void setup(){
+  // ป้องกัน Brownout
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
+
   Serial.begin(115200);
 
   pinMode(BTN_PIN, INPUT_PULLUP);
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
 
-  attachInterrupt(BTN_PIN, switchModeISR, FALLING);
-
   // SD
   SPI_SD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
-  SD.begin(SD_CS, SPI_SD);
+  if(!SD.begin(SD_CS, SPI_SD)){
+    Serial.println("❌ SD Mount Failed");
+  } else {
+    Serial.println("✅ SD Mounted");
+  }
 
   // RFID
   SPI_RFID.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
   rfid.PCD_Init();
 
-  // Start SD I2S
+  // เริ่มต้นด้วยโหมด SD/RFID
+  Serial.println("Starting in RFID Mode...");
+  mode = 0;
   i2s_init_sd();
 
   // Tasks
@@ -309,89 +371,66 @@ void setup(){
   Serial.println("System Ready!");
 }
 
+// ---------------- LOOP (Button Logic) ----------------
 void loop() {
-  // ---------------- MODE BUTTON ----------------
+  // --- MODE / PLAY / PAUSE BUTTON ---
   bool btnNow = digitalRead(BTN_PIN);
-  // ตรวจว่ากดลง
   if (btnPrev == HIGH && btnNow == LOW) {
     pressStart = millis();
   }
-  // ตรวจว่าปล่อยปุ่ม
   if (btnPrev == LOW && btnNow == HIGH) {
     unsigned long pressTime = millis() - pressStart;
 
-    if (pressTime < 500) {
-      // -------------------------
-      //   Short Press (กดสั้น)
-      // -------------------------
-      if (isPlaying) {
-        stopAudio();   // หยุดเพลง
-        isPlaying = false;
-        Serial.println("⏸️ Short Press: Stop");
+    if (pressTime < 800) {
+      // --- Short Press: Toggle Play/Pause ---
+      if (mode == 1) {
+          // ในโหมด BT เราเช็คสถานะยาก ให้ toggle เอาเลย หรือสั่ง play/pause
+          // แต่ A2DP Sink เช็คสถานะลำบาก สมมติว่าสั่งสลับกัน
+          // *ถ้าจะให้แม่นยำ ต้องดู state จาก library แต่กดซ้ำๆ ก็ work ครับ
+           // โค้ดที่แก้ไข
+          if(a2dp_sink.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED){
+            stopAudio();
+          }else {
+            playAudio();
+          }
       } else {
-        playAudio();   // เล่นเพลง
-        isPlaying = true;
-        Serial.println("▶️ Short Press: Play");
+          // โหมด SD
+          if (isPlaying) stopAudio();
+          else playAudio();
       }
 
     } else {
-      // -------------------------
-      //   Long Press (กดค้าง)
-      // -------------------------
-      mode = !mode;
-      Serial.print("🔄 Long Press: Mode changed to ");
-      Serial.println(mode == 0 ? "💿RFID" : "🔊Bluetooth");
+      // --- Long Press: Switch Mode ---
+      if (mode == 0) {
+        enterModeBluetooth();
+      } else {
+        enterModeRFID();
+      }
     }
   }
   btnPrev = btnNow;
 
-  // ---------------- NEXT BUTTON ----------------
+  // --- NEXT BUTTON ---
   bool nextNow = digitalRead(BTN_NEXT);
-
-  if(nextPrev == HIGH && nextNow == LOW){
-    nextPressStart = millis();
-  }
-
+  if(nextPrev == HIGH && nextNow == LOW) nextPressStart = millis();
   if(nextPrev == LOW && nextNow == HIGH){
-    unsigned long pressTime = millis() - nextPressStart;
-
-    if(pressTime < 500){
-      // short press = volume up
-      if(mode == 1){
-          volumeUp();     // Bluetooth mode
-      } else {
-          sdVolumeUp();   // SD / RFID mode
-      }
-    }else{
-      // long press = next song (BT only)
-      btNext();
+    if((millis() - nextPressStart) < 500){
+       if(mode==1) volumeUp(); else sdVolumeUp();
+    } else {
+       if(mode==1) a2dp_sink.next();
     }
   }
   nextPrev = nextNow;
 
-  // ---------------- PREV BUTTON ----------------
+  // --- PREV BUTTON ---
   bool prevNow = digitalRead(BTN_PREV);
-
-  if(prevPrev == HIGH && prevNow == LOW){
-    prevPressStart = millis();
-  }
-
+  if(prevPrev == HIGH && prevNow == LOW) prevPressStart = millis();
   if(prevPrev == LOW && prevNow == HIGH){
-    unsigned long pressTime = millis() - prevPressStart;
-
-    if(pressTime < 500){
-      // short press = volume down
-      if(mode == 1){
-          volumeDown();       // Bluetooth mode
-      } else {
-          sdVolumeDown();     // SD / RFID mode
-      }
-    }else{
-      // long press = prev song (BT only)
-      btPrev();
+    if((millis() - prevPressStart) < 500){
+       if(mode==1) volumeDown(); else sdVolumeDown();
+    } else {
+       if(mode==1) a2dp_sink.previous();
     }
   }
-
   prevPrev = prevNow;  
-
 }
