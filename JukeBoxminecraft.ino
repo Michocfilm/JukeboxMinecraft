@@ -53,7 +53,7 @@ float sdVolume = 1.0f;  // SD Volume
 File file;
 bool isPlaying = false;
 byte lastUID[4] = {0,0,0,0};
-
+bool isManuallyPaused = false;
 uint8_t buffer[512];
 size_t bytes_written;
 
@@ -223,7 +223,7 @@ void TaskRFID(void *pv){
       lastSeen = millis();
 
       if(isSameUID(rfid.uid.uidByte, lastUID)){
-        if (!isPlaying) {
+        if (!isPlaying && !isManuallyPaused) {
              // ถ้าวางบัตรเดิม แต่เพลงหยุดไปแล้ว ให้เล่นใหม่
              isPlaying = true;
         }
@@ -289,11 +289,13 @@ void playAudio() {
   if (mode == 1) {
     Serial.println("▶️ BT Play Request");
     a2dp_sink.play(); // สั่ง BT เล่น
+    isManuallyPaused = false; // <--- เพิ่ม: ผู้ใช้สั่งเล่นแล้ว รีเซ็ตสถานะ
   } else {
     if (file) {
         Serial.println("▶️ SD Play Request");
-        file.seek(44);
+        // file.seek(44);
         isPlaying = true;
+        isManuallyPaused = false; // <--- เพิ่ม: ผู้ใช้สั่งเล่นแล้ว รีเซ็ตสถานะ
     }
   }
 }
@@ -302,10 +304,12 @@ void stopAudio() {
   if (mode == 1) {
     Serial.println("⏸️ BT Pause Request");
     a2dp_sink.pause(); // สั่ง BT หยุดชั่วคราว
+    isManuallyPaused = true; // <--- เพิ่ม: เพื่อไม่ให้ TaskRFID เล่นต่อเอง
   } else {
     Serial.println("⏸️ SD Stop Request");
     fadeOut();
     isPlaying = false;
+    isManuallyPaused = true; // <--- เพิ่ม: เพื่อไม่ให้ TaskRFID เล่นต่อเอง
     injectSilence();
   }
 }
