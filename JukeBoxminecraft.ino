@@ -143,9 +143,7 @@ void enterModeBluetooth() {
   isPlaying = false;
   if(file) file.close();
   injectSilence();
-  
-  // 2. ถอด Driver SD ออก (สำคัญมาก! ไม่งั้น BT จะแย่งใช้ไม่ได้)
-  i2s_driver_uninstall(I2S_NUM_0); 
+  i2s_driver_uninstall(I2S_NUM_0); //ล้างขาเพื่อไม่ให้ i2s ชนกัน
   delay(200);
 
   // 3. เริ่ม Bluetooth
@@ -173,12 +171,11 @@ void enterModeRFID() {
 
   // 2. เริ่ม Driver SD ใหม่
   i2s_init_sd();
-  
   mode = 0;
   isPlaying = false;
-  isManuallyPaused = false;   // <<< สำคัญ: ล้างสถานะหยุดด้วยมือ
+  isManuallyPaused = false;  
   // ล้าง UID ล่าสุด เพื่อให้บัตรเดิมที่แตะอีกครั้งถูกมองว่าเป็น "บัตรใหม่" 
-  memset(lastUID, 0, 4);      // <<< สำคัญ: ล้าง UID ล่าสุด
+  memset(lastUID, 0, 4);    
   Serial.println("✅ RFID Mode Ready");
 }
 
@@ -250,12 +247,10 @@ void TaskRFID(void *pv){
 // ---------------- TASK AUDIO ----------------
 void TaskAudio(void *pv){
   while(1){
-    // Bluetooth Mode -> ปล่อยให้ Library จัดการ เราไม่ต้องยุ่ง
     if(mode == 1){
       vTaskDelay(100);
       continue;
     }
-
     // SD Player Mode
     if(!isPlaying){
       vTaskDelay(10);
@@ -292,13 +287,13 @@ void playAudio() {
   if (mode == 1) {
     Serial.println("▶️ BT Play Request");
     a2dp_sink.play(); // สั่ง BT เล่น
-    isManuallyPaused = false; // <--- เพิ่ม: ผู้ใช้สั่งเล่นแล้ว รีเซ็ตสถานะ
+    isManuallyPaused = false; 
   } else {
     if (file) {
         Serial.println("▶️ SD Play Request");
         // file.seek(44);
         isPlaying = true;
-        isManuallyPaused = false; // <--- เพิ่ม: ผู้ใช้สั่งเล่นแล้ว รีเซ็ตสถานะ
+        isManuallyPaused = false; 
     }
   }
 }
@@ -307,12 +302,12 @@ void stopAudio() {
   if (mode == 1) {
     Serial.println("⏸️ BT Pause Request");
     a2dp_sink.pause(); // สั่ง BT หยุดชั่วคราว
-    isManuallyPaused = true; // <--- เพิ่ม: เพื่อไม่ให้ TaskRFID เล่นต่อเอง
+    isManuallyPaused = true; 
   } else {
     Serial.println("⏸️ SD Stop Request");
     fadeOut();
     isPlaying = false;
-    isManuallyPaused = true; // <--- เพิ่ม: เพื่อไม่ให้ TaskRFID เล่นต่อเอง
+    isManuallyPaused = true; 
     injectSilence();
   }
 }
@@ -346,14 +341,11 @@ void sdVolumeDown(){
 // ---------------- SETUP ----------------
 void setup(){
   // ป้องกัน Brownout
-  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); 
-
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0); // กันไม่ให้ reboot เองตอนไฟตกหรือกระแสรไม่พอ
   Serial.begin(115200);
-
   pinMode(BTN_PIN, INPUT_PULLUP);
   pinMode(BTN_NEXT, INPUT_PULLUP);
   pinMode(BTN_PREV, INPUT_PULLUP);
-
   // SD
   SPI_SD.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
   if(!SD.begin(SD_CS, SPI_SD)){
@@ -365,12 +357,10 @@ void setup(){
   // RFID
   SPI_RFID.begin(RFID_SCK, RFID_MISO, RFID_MOSI, RFID_SS);
   rfid.PCD_Init();
-
   // เริ่มต้นด้วยโหมด SD/RFID
   Serial.println("Starting in RFID Mode...");
   mode = 0;
   i2s_init_sd();
-
   // Tasks
   xTaskCreatePinnedToCore(TaskRFID,  "RFID",  4096, NULL, 1, NULL, 1);
   xTaskCreatePinnedToCore(TaskAudio, "AUDIO", 4096, NULL, 1, NULL, 0);
@@ -394,7 +384,6 @@ void loop() {
           // ในโหมด BT เราเช็คสถานะยาก ให้ toggle เอาเลย หรือสั่ง play/pause
           // แต่ A2DP Sink เช็คสถานะลำบาก สมมติว่าสั่งสลับกัน
           // *ถ้าจะให้แม่นยำ ต้องดู state จาก library แต่กดซ้ำๆ ก็ work ครับ
-           // โค้ดที่แก้ไข
           if(a2dp_sink.get_audio_state() == ESP_A2D_AUDIO_STATE_STARTED){
             stopAudio();
           }else {
